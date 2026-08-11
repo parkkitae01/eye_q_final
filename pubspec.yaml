@@ -43,6 +43,8 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  integration_test:
+    sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -64,7 +66,8 @@ flutter:
 
   # AI 모델 파일을 앱 자산으로 포함
   assets:
-    - assets/models/yolov10n.onnx
+    - assets/models/yolov8n.onnx
+    - assets/test_images/
 
     # To add assets to your application, add an assets section, like this:
     # assets:
