@@ -68,6 +68,12 @@ flutter:
   assets:
     - assets/models/yolov8n.onnx
     - assets/test_images/
+    - assets/test_images/천천히_걷기_1/
+    - assets/test_images/천천히_걷기_1-2/
+    - assets/test_images/보통_걷기_1/
+    - assets/test_images/보통_걷기_1-2/
+    - assets/test_images/조깅_1/
+    - assets/test_images/조깅_1-2/
 
     # To add assets to your application, add an assets section, like this:
     # assets:

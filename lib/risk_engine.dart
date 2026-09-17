@@ -61,16 +61,47 @@ const Map<RiskGrade, String> kGradeName = {
 RiskGrade getRiskLevel(int classId) => kRiskLevels[classId] ?? RiskGrade.low;
 
 // ─────────────────────────────────────────────
-// 박스 변화율 기반 TTC (초)  (Python: estimate_ttc)
-//   - 이전 높이가 없거나 dt<=0  → 무한대
-//   - 박스가 안 커짐(멀어짐/정지) → 무한대
+// 최근 프레임 기록 기반 TTC (초)  — 노이즈에 강한 버전
+//   - history: (누적시간, 박스높이) 기록, 오래된 것→최신 순
+//   - 최근 최대 5개 프레임의 추세선(최소제곱법 기울기)으로 성장 속도를 구함
+//   - 기록이 2개 미만이거나, 추세가 "안 커짐"이면 → 무한대
 // ─────────────────────────────────────────────
-double estimateTtc(double? prevHeight, double curHeight, double dt) {
-  if (prevHeight == null || dt <= 0) return double.infinity;
-  final dh = curHeight - prevHeight;
-  if (dh <= 0) return double.infinity;
-  final growthRate = dh / dt;
+double estimateTtc(List<(double, double)> history) {
+  if (history.length < 2) return double.infinity;
+
+  final window =
+  history.length > 5 ? history.sublist(history.length - 5) : history;
+
+  final n = window.length;
+  final tMean = window.map((p) => p.$1).reduce((a, b) => a + b) / n;
+  final hMean = window.map((p) => p.$2).reduce((a, b) => a + b) / n;
+
+  double num = 0, den = 0;
+  for (final (t, h) in window) {
+    num += (t - tMean) * (h - hMean);
+    den += (t - tMean) * (t - tMean);
+  }
+  if (den == 0) return double.infinity;
+
+  final growthRate = num / den; // 초당 픽셀 증가량 (추세선 기울기)
+  if (growthRate <= 0) return double.infinity;
+
+  final curHeight = window.last.$2;
   return curHeight / growthRate;
+}
+
+// ─────────────────────────────────────────────
+// 근접 안전장치: 박스 높이가 화면 높이의 80% 이상이면
+// TTC/트랙 히스토리 상태와 무관하게 무조건 CRITICAL로 강제 처리
+//   - 근접 상태에서는 트랙 ID 리셋으로 TTC가 신뢰 불가능해지므로
+//     "거의 충돌 임박"에 해당하는 작은 TTC(0.1초)로 강제 대입
+// ─────────────────────────────────────────────
+const double kProximityCriticalRatio = 0.8;
+const double kForcedProximityTtc = 0.1;
+
+bool isProximityCritical(double boxHeight, double frameHeight) {
+  if (frameHeight <= 0) return false;
+  return (boxHeight / frameHeight) >= kProximityCriticalRatio;
 }
 
 // ─────────────────────────────────────────────
@@ -90,6 +121,37 @@ double directionWeight(double cx, double frameWidth) {
 double computeRiskScore(RiskGrade grade, double ttc, double dirW) {
   if (ttc.isInfinite || ttc <= 0) return 0;
   return (kGradeWeight[grade]! / ttc) * dirW;
+}
+
+// ─────────────────────────────────────────────
+// 최종 위험 판정 (grade, ttc, score)을 한 번에 계산.
+//   - 기본 흐름: getRiskLevel() → estimateTtc() → computeRiskScore()
+//   - 단, 근접 안전장치(isProximityCritical)에 걸리면
+//     classId나 트랙 히스토리 상태와 무관하게 CRITICAL로 덮어씀
+//   Detection을 만드는 호출부(트래커/메인 루프)에서는
+//   getRiskLevel()/estimateTtc()/computeRiskScore()를 따로 부르지 말고
+//   이 함수 하나만 호출하면 됨.
+// ─────────────────────────────────────────────
+(RiskGrade, double, double) resolveRisk({
+  required int classId,
+  required List<(double, double)> heightHistory,
+  required double dirW,
+  required double boxHeight,
+  required double frameHeight,
+}) {
+  if (isProximityCritical(boxHeight, frameHeight)) {
+    final score = computeRiskScore(
+      RiskGrade.critical,
+      kForcedProximityTtc,
+      dirW,
+    );
+    return (RiskGrade.critical, kForcedProximityTtc, score);
+  }
+
+  final grade = getRiskLevel(classId);
+  final ttc = estimateTtc(heightHistory);
+  final score = computeRiskScore(grade, ttc, dirW);
+  return (grade, ttc, score);
 }
 
 // ─────────────────────────────────────────────

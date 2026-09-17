@@ -2,7 +2,7 @@
 // 👁️  EYE-Q : 경량 객체 트래커 (블록 4-2)
 // ════════════════════════════════════════════════════════════════
 // Python model.track()이 주던 객체 ID를 IoU 매칭으로 직접 부여하고,
-// 이전 프레임 높이와 비교해 TTC·위험도 점수까지 계산한다.
+// 최근 프레임 높이 기록(추세선)으로 TTC·위험도 점수까지 계산한다.
 // 파일 위치: lib/object_tracker.dart
 // ════════════════════════════════════════════════════════════════
 
@@ -28,16 +28,22 @@ class RawDetection {
 }
 
 // ─────────────────────────────────────────────
-// 내부 추적 상태 (한 물체의 직전 모습)
+// 내부 추적 상태 (한 물체의 최근 모습)
 // ─────────────────────────────────────────────
 class _Track {
   final int id;
   final int classId;
   Rect box;
-  double height;
+  final List<(double, double)> heightHistory; // (누적시간, 박스높이) 최근 5개
   int missed; // 연속으로 매칭 안 된 프레임 수
 
-  _Track(this.id, this.classId, this.box, this.height, this.missed);
+  _Track(this.id, this.classId, this.box, double height, double t, this.missed)
+      : heightHistory = [(t, height)];
+
+  void addHeight(double t, double height) {
+    heightHistory.add((t, height));
+    if (heightHistory.length > 5) heightHistory.removeAt(0);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -54,10 +60,15 @@ class ObjectTracker {
 
   ObjectTracker({this.iouThreshold = 0.3, this.maxMissed = 5});
 
+  // ⚠️ t = 추적 시작 시점부터 누적된 시간(초). 프레임 간 간격(delta)이 아님.
+  // ⚠️ frameHeight 추가: risk_engine.dart의 근접 안전장치(resolveRisk)가
+  //    "박스 높이가 화면의 80% 이상인지"를 판단하려면 화면 세로 길이가 필요함.
+  //    → 호출부(main.dart 등)에서 반드시 인자를 하나 더 넘겨줘야 함.
   List<Detection> update(
       List<RawDetection> raws,
-      double dt,
+      double t,
       double frameWidth,
+      double frameHeight,
       ) {
     final results = <Detection>[];
     final newTracks = <_Track>[];
@@ -79,29 +90,36 @@ class ObjectTracker {
 
       final curHeight = raw.box.height;
       int trackId;
-      double ttc;
+      List<(double, double)> heightHistoryForRisk;
 
       if (bestIdx >= 0) {
-        // 2) 기존 물체와 매칭됨 → ID 승계 + TTC 계산
-        final t = _tracks[bestIdx];
+        // 2) 기존 물체와 매칭됨 → ID 승계 + 기록 추가
+        final tr = _tracks[bestIdx];
         used.add(bestIdx);
-        trackId = t.id;
-        ttc = estimateTtc(t.height, curHeight, dt);
-        // 트랙 최신화
-        t.box = raw.box;
-        t.height = curHeight;
-        t.missed = 0;
+        trackId = tr.id;
+        tr.addHeight(t, curHeight);
+        heightHistoryForRisk = tr.heightHistory;
+        tr.box = raw.box;
+        tr.missed = 0;
       } else {
-        // 3) 처음 본 물체 → 새 ID 발급 (비교 대상 없으니 TTC 무한대)
+        // 3) 처음 본 물체 → 새 ID 발급 (기록 1개뿐이니 TTC는 resolveRisk 내부에서 무한대 처리)
         trackId = _nextId++;
-        ttc = double.infinity;
-        newTracks.add(_Track(trackId, raw.classId, raw.box, curHeight, 0));
+        final newTrack = _Track(trackId, raw.classId, raw.box, curHeight, t, 0);
+        newTracks.add(newTrack);
+        heightHistoryForRisk = newTrack.heightHistory;
       }
 
       // 4) 위험도 계산 (risk_engine.dart의 두뇌 사용)
-      final grade = getRiskLevel(raw.classId);
+      //    - 기존: getRiskLevel() + estimateTtc() + computeRiskScore()를 각각 호출
+      //    - 변경: resolveRisk() 하나로 통합, 근접(박스 80% 이상) 시 강제 CRITICAL 처리 포함
       final dirW = directionWeight(raw.box.center.dx, frameWidth);
-      final score = computeRiskScore(grade, ttc, dirW);
+      final (grade, ttc, score) = resolveRisk(
+        classId: raw.classId,
+        heightHistory: heightHistoryForRisk,
+        dirW: dirW,
+        boxHeight: curHeight,
+        frameHeight: frameHeight,
+      );
 
       results.add(Detection(
         box: raw.box,

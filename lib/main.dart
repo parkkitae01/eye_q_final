@@ -85,7 +85,15 @@ class _DetectionScreenState extends State<DetectionScreen> {
     try {
       final rgb = _yuv420ToImage(image);
       final raws = await _detector.detect(rgb);
-      final dets = _tracker.update(raws, dt, rgb.width.toDouble());
+      // ⚠️ frameHeight(rgb.height.toDouble()) 추가:
+      //    risk_engine.dart의 근접 안전장치(resolveRisk)가 "박스가 화면의
+      //    80% 이상인지" 판단하려면 화면 세로 길이가 필요해서 추가됨.
+      final dets = _tracker.update(
+        raws,
+        dt,
+        rgb.width.toDouble(),
+        rgb.height.toDouble(),
+      );
       final top = _tracker.topThreat(dets);
       if (mounted) {
         setState(() {
