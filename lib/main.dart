@@ -2,10 +2,15 @@
 // 👁️  EYE-Q : 메인 앱 (블록 4-4 카메라 연결 + 4-5 화면 그리기)
 // ════════════════════════════════════════════════════════════════
 // 카메라 스트림 → YOLO 추론 → 트래커(ID·TTC) → CustomPaint HUD
+// ⚠️ 수정: YUV→RGB 변환을 compute()로 별도 isolate에서 실행하도록 변경
+//    (기존엔 UI 스레드에서 픽셀 단위 for문을 동기 실행 → 화면 끊김/지연 원인)
 // 기존 lib/main.dart 내용을 전부 지우고 이걸로 교체하세요.
 // ════════════════════════════════════════════════════════════════
 
+import 'dart:typed_data';
+
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart'; // compute() 사용
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
@@ -83,7 +88,27 @@ class _DetectionScreenState extends State<DetectionScreen> {
     _lastMs = now;
 
     try {
-      final rgb = _yuv420ToImage(image);
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+
+      // ⚠️ UI 스레드 블로킹 방지: YUV→RGB 변환을 별도 isolate에서 실행.
+      //    CameraImage 객체 자체는 isolate로 못 넘기므로, 필요한 바이트만
+      //    뽑아서 _YuvFrame에 담아 compute()에 넘김.
+      final rgb = await compute(
+        _convertYuv420,
+        _YuvFrame(
+          yBytes: yPlane.bytes,
+          uBytes: uPlane.bytes,
+          vBytes: vPlane.bytes,
+          width: image.width,
+          height: image.height,
+          yRowStride: yPlane.bytesPerRow,
+          uvRowStride: uPlane.bytesPerRow,
+          uvPixelStride: uPlane.bytesPerPixel ?? 1,
+        ),
+      );
+
       final raws = await _detector.detect(rgb);
       // ⚠️ frameHeight(rgb.height.toDouble()) 추가:
       //    risk_engine.dart의 근접 안전장치(resolveRisk)가 "박스가 화면의
@@ -109,37 +134,6 @@ class _DetectionScreenState extends State<DetectionScreen> {
     } finally {
       _busy = false;
     }
-  }
-
-  // ─── CameraImage(YUV420) → image.Image(RGB) ───
-  //   Android 카메라 기본 포맷. 폰에서 가장 디버깅이 필요한 부분.
-  img.Image _yuv420ToImage(CameraImage cameraImage) {
-    final int width = cameraImage.width;
-    final int height = cameraImage.height;
-    final yPlane = cameraImage.planes[0];
-    final uPlane = cameraImage.planes[1];
-    final vPlane = cameraImage.planes[2];
-    final int uvRowStride = uPlane.bytesPerRow;
-    final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
-
-    final image = img.Image(width: width, height: height);
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        final int uvIndex =
-            uvPixelStride * (x ~/ 2) + uvRowStride * (y ~/ 2);
-        final int yIndex = y * yPlane.bytesPerRow + x;
-        final int yp = yPlane.bytes[yIndex];
-        final int up = uPlane.bytes[uvIndex];
-        final int vp = vPlane.bytes[uvIndex];
-        final int r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
-        final int g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128))
-            .round()
-            .clamp(0, 255);
-        final int b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
-        image.setPixelRgb(x, y, r, g, b);
-      }
-    }
-    return image;
   }
 
   @override
@@ -174,6 +168,49 @@ class _DetectionScreenState extends State<DetectionScreen> {
       ),
     );
   }
+}
+
+// ─── isolate로 넘길 순수 데이터만 담는 클래스 ───
+// (CameraImage는 통째로 isolate에 못 넘기므로 바이트/치수만 추려서 담음)
+class _YuvFrame {
+  final Uint8List yBytes, uBytes, vBytes;
+  final int width, height;
+  final int yRowStride, uvRowStride, uvPixelStride;
+
+  _YuvFrame({
+    required this.yBytes,
+    required this.uBytes,
+    required this.vBytes,
+    required this.width,
+    required this.height,
+    required this.yRowStride,
+    required this.uvRowStride,
+    required this.uvPixelStride,
+  });
+}
+
+// ─── CameraImage(YUV420) → image.Image(RGB) ───
+//   ⚠️ top-level 함수여야 compute()에서 별도 isolate로 실행 가능함
+//   (클래스 메서드로 두면 compute()에 못 넘김)
+img.Image _convertYuv420(_YuvFrame f) {
+  final image = img.Image(width: f.width, height: f.height);
+  for (int y = 0; y < f.height; y++) {
+    for (int x = 0; x < f.width; x++) {
+      final int uvIndex =
+          f.uvPixelStride * (x ~/ 2) + f.uvRowStride * (y ~/ 2);
+      final int yIndex = y * f.yRowStride + x;
+      final int yp = f.yBytes[yIndex];
+      final int up = f.uBytes[uvIndex];
+      final int vp = f.vBytes[uvIndex];
+      final int r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
+      final int g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128))
+          .round()
+          .clamp(0, 255);
+      final int b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
+      image.setPixelRgb(x, y, r, g, b);
+    }
+  }
+  return image;
 }
 
 // ─── 4-5: 박스 + HUD 그리기 (Python 시각화 그대로 이식) ───
