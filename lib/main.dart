@@ -1,16 +1,18 @@
 // ════════════════════════════════════════════════════════════════
-// 👁️  EYE-Q : 메인 앱 (블록 4-4 카메라 연결 + 4-5 화면 그리기)
+// 👁️  EYE-Q : 메인 앱 (카메라 → YOLO → 트래커 → HUD)
 // ════════════════════════════════════════════════════════════════
-// 카메라 스트림 → YOLO 추론 → 트래커(ID·TTC) → CustomPaint HUD
-// ⚠️ 수정: YUV→RGB 변환을 compute()로 별도 isolate에서 실행하도록 변경
-//    (기존엔 UI 스레드에서 픽셀 단위 for문을 동기 실행 → 화면 끊김/지연 원인)
+// ⚠️ 수정 이력
+//  1) YUV→RGB 변환을 compute()로 별도 isolate에서 실행 (UI 스레드 블로킹 제거)
+//  2) FPS 누적 통계 + 워밍업 프레임 제외 + 구간별 소요시간(conv/detect/track)
+//  3) [이번 수정] detect 내부 구간(lbox/fill/send/run/recv/flat/post)까지 HUD 표시
+//     + FPS 배지가 상태바 시계와 겹치던 문제 수정 (상태바 높이만큼 HUD를 아래로 내림)
 // 기존 lib/main.dart 내용을 전부 지우고 이걸로 교체하세요.
 // ════════════════════════════════════════════════════════════════
 
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart'; // compute() 사용
+import 'package:flutter/foundation.dart'; // compute(), debugPrint
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
@@ -59,6 +61,20 @@ class _DetectionScreenState extends State<DetectionScreen> {
   bool _busy = false; // 추론 중이면 프레임 스킵 (밀림 방지)
   int _lastMs = DateTime.now().millisecondsSinceEpoch;
 
+  // ── 성능 측정용 ──
+  static const int _warmupFrames = 10; // 초기 N프레임은 통계에서 제외
+  int _frameCount = 0; // 처리한 전체 프레임 수
+  int _statFrames = 0; // 통계에 포함된 프레임 수 (워밍업 이후)
+  int _statStartMs = 0; // 통계 시작 시각
+  double _fpsMin = double.infinity;
+  double _fpsMax = 0;
+  double _fpsAvg = 0; // 통계 구간 평균 FPS = 프레임 수 / 경과 시간
+  double _sumConvMs = 0;
+  double _sumDetectMs = 0;
+  double _sumTrackMs = 0;
+  // detect 내부 구간 누적: [letterbox, fill, send, run, recv, flatten, post]
+  final List<double> _sumSub = List<double>.filled(7, 0);
+
   @override
   void initState() {
     super.initState();
@@ -92,9 +108,8 @@ class _DetectionScreenState extends State<DetectionScreen> {
       final uPlane = image.planes[1];
       final vPlane = image.planes[2];
 
-      // ⚠️ UI 스레드 블로킹 방지: YUV→RGB 변환을 별도 isolate에서 실행.
-      //    CameraImage 객체 자체는 isolate로 못 넘기므로, 필요한 바이트만
-      //    뽑아서 _YuvFrame에 담아 compute()에 넘김.
+      // ① YUV→RGB 변환 (별도 isolate)
+      final swConv = Stopwatch()..start();
       final rgb = await compute(
         _convertYuv420,
         _YuvFrame(
@@ -108,24 +123,78 @@ class _DetectionScreenState extends State<DetectionScreen> {
           uvPixelStride: uPlane.bytesPerPixel ?? 1,
         ),
       );
+      swConv.stop();
 
-      final raws = await _detector.detect(rgb);
-      // ⚠️ frameHeight(rgb.height.toDouble()) 추가:
-      //    risk_engine.dart의 근접 안전장치(resolveRisk)가 "박스가 화면의
-      //    80% 이상인지" 판단하려면 화면 세로 길이가 필요해서 추가됨.
+      // ② 탐지 (전처리 + ONNX 추론 + 후처리 전체)
+      final swDet = Stopwatch()..start();
+      // 카메라 프레임은 센서 방향(가로)으로 오므로, 세워서 탐지 + 세워진 크기 기준으로 좌표 사용
+      final int rot = _camera!.description.sensorOrientation;
+      final raws = await _detector.detect(rgb, rotation: rot);
+      final bool swap = rot == 90 || rot == 270;
+      final double iw = (swap ? rgb.height : rgb.width).toDouble();
+      final double ih = (swap ? rgb.width : rgb.height).toDouble();
+      swDet.stop();
+
+      // ③ 트래킹 + 위험도 계산
+      final swTrk = Stopwatch()..start();
       final dets = _tracker.update(
         raws,
         dt,
-        rgb.width.toDouble(),
-        rgb.height.toDouble(),
+        iw,
+        ih,
       );
       final top = _tracker.topThreat(dets);
+      swTrk.stop();
+
+      final double fpsNow = dt > 0 ? 1 / dt : 0;
+
+      // ── 통계 갱신 (워밍업 이후 프레임만) ──
+      _frameCount++;
+      if (_frameCount == _warmupFrames) {
+        _statStartMs = now; // 워밍업 마지막 프레임 시점부터 통계 시작
+      } else if (_frameCount > _warmupFrames) {
+        _statFrames++;
+        if (fpsNow > 0) {
+          if (fpsNow < _fpsMin) _fpsMin = fpsNow;
+          if (fpsNow > _fpsMax) _fpsMax = fpsNow;
+        }
+        _sumConvMs += swConv.elapsedMicroseconds / 1000.0;
+        _sumDetectMs += swDet.elapsedMicroseconds / 1000.0;
+        _sumTrackMs += swTrk.elapsedMicroseconds / 1000.0;
+
+        final tm = _detector.timings;
+        _sumSub[0] += tm.letterbox;
+        _sumSub[1] += tm.tensorFill;
+        _sumSub[2] += tm.send;
+        _sumSub[3] += tm.run;
+        _sumSub[4] += tm.receive;
+        _sumSub[5] += tm.flatten;
+        _sumSub[6] += tm.post;
+
+        final double elapsedSec = (now - _statStartMs) / 1000.0;
+        _fpsAvg = elapsedSec > 0 ? _statFrames / elapsedSec : 0;
+
+        // 50프레임마다 콘솔에도 기록 (복사해서 보고서에 쓰기 편하게)
+        if (_statFrames % 50 == 0) {
+          String s(int i) => (_sumSub[i] / _statFrames).toStringAsFixed(1);
+          debugPrint(
+            '[EYE-Q][perf] n=$_statFrames '
+                'avgFps=${_fpsAvg.toStringAsFixed(1)} '
+                'conv=${(_sumConvMs / _statFrames).toStringAsFixed(1)}ms '
+                'detect=${(_sumDetectMs / _statFrames).toStringAsFixed(1)}ms '
+                'track=${(_sumTrackMs / _statFrames).toStringAsFixed(1)}ms | '
+                'lbox=${s(0)} fill=${s(1)} send=${s(2)} run=${s(3)} '
+                'recv=${s(4)} flat=${s(5)} post=${s(6)}',
+          );
+        }
+      }
+
       if (mounted) {
         setState(() {
-          _imageSize = Size(rgb.width.toDouble(), rgb.height.toDouble());
+          _imageSize = Size(iw, ih);
           _detections = dets;
           _top = top;
-          _fps = dt > 0 ? 1 / dt : 0;
+          _fps = fpsNow;
         });
       }
     } catch (e) {
@@ -151,6 +220,34 @@ class _DetectionScreenState extends State<DetectionScreen> {
         body: Center(child: CircularProgressIndicator()),
       );
     }
+
+    // 상태바 높이: HUD가 시계/상태 아이콘과 겹치지 않도록 이만큼 아래로 내린다
+    final double topInset = MediaQuery.of(context).padding.top;
+
+    // HUD에 표시할 통계 문자열
+    final String statText = _statFrames == 0
+        ? 'warm-up $_frameCount/$_warmupFrames'
+        : 'avg ${_fpsAvg.toStringAsFixed(1)} / '
+        'min ${(_fpsMin.isInfinite ? 0 : _fpsMin).toStringAsFixed(1)} / '
+        'max ${_fpsMax.toStringAsFixed(1)} (n=$_statFrames)';
+
+    String stageText = '';
+    String sub1 = '';
+    String sub2 = '';
+    if (_statFrames > 0) {
+      final double c = _sumConvMs / _statFrames;
+      final double d = _sumDetectMs / _statFrames;
+      final double t = _sumTrackMs / _statFrames;
+      stageText = 'ms  conv ${c.toStringAsFixed(0)} / '
+          'detect ${d.toStringAsFixed(0)} / '
+          'track ${t.toStringAsFixed(0)} '
+          '(sum ${(c + d + t).toStringAsFixed(0)})';
+
+      String f(int i) => (_sumSub[i] / _statFrames).toStringAsFixed(0);
+      sub1 = 'detect: lbox ${f(0)} / fill ${f(1)} / send ${f(2)} / run ${f(3)}';
+      sub2 = 'detect: recv ${f(4)} / flat ${f(5)} / post ${f(6)}';
+    }
+
     return Scaffold(
       body: Stack(
         fit: StackFit.expand,
@@ -162,6 +259,11 @@ class _DetectionScreenState extends State<DetectionScreen> {
               top: _top,
               imageSize: _imageSize,
               fps: _fps,
+              topInset: topInset,
+              statText: statText,
+              stageText: stageText,
+              subText1: sub1,
+              subText2: sub2,
             ),
           ),
         ],
@@ -191,7 +293,6 @@ class _YuvFrame {
 
 // ─── CameraImage(YUV420) → image.Image(RGB) ───
 //   ⚠️ top-level 함수여야 compute()에서 별도 isolate로 실행 가능함
-//   (클래스 메서드로 두면 compute()에 못 넘김)
 img.Image _convertYuv420(_YuvFrame f) {
   final image = img.Image(width: f.width, height: f.height);
   for (int y = 0; y < f.height; y++) {
@@ -213,21 +314,32 @@ img.Image _convertYuv420(_YuvFrame f) {
   return image;
 }
 
-// ─── 4-5: 박스 + HUD 그리기 (Python 시각화 그대로 이식) ───
+// ─── 4-5: 박스 + HUD 그리기 ───
 class _HudPainter extends CustomPainter {
   final List<Detection> detections;
   final Detection? top;
   final Size imageSize;
   final double fps;
+  final double topInset; // 상태바 높이 (HUD 시작 위치)
+  final String statText; // avg/min/max FPS 줄
+  final String stageText; // conv/detect/track 줄
+  final String subText1; // detect 내부 구간 1
+  final String subText2; // detect 내부 구간 2
 
   _HudPainter({
     required this.detections,
     required this.top,
     required this.imageSize,
     required this.fps,
+    required this.topInset,
+    required this.statText,
+    required this.stageText,
+    required this.subText1,
+    required this.subText2,
   });
 
-  static const double hudBottom = 65; // 상단 헤더 높이 (라벨 겹침 방지)
+  // HUD 영역 아래쪽 끝 (박스 라벨이 HUD와 겹치지 않게 하는 기준선)
+  double get hudBottom => topInset + 148;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -267,12 +379,31 @@ class _HudPainter extends CustomPainter {
       _drawTextBg(canvas, label, Offset(rect.left, ly), color, 12);
     }
 
-    // ── 상단 HUD ──
-    _drawTextBg(canvas, 'FPS: ${fps.toStringAsFixed(0)}',
-        const Offset(8, 8), const Color(0xFFFFFFFF), 14);
+    // ── 상단 HUD (상태바 아래부터) ──
+    final double t = topInset;
+    _drawTextBg(canvas, 'FPS: ${fps.toStringAsFixed(0)}', Offset(8, t + 8),
+        const Color(0xFFFFFFFF), 14);
     final String summary = top != null ? top!.summaryText : 'No threat';
-    _drawTextBg(canvas, summary, const Offset(8, 34),
+    _drawTextBg(canvas, summary, Offset(8, t + 34),
         top != null ? const Color(0xFFFF0000) : const Color(0xFF00FF00), 14);
+
+    // 누적 FPS 통계 (노란색)
+    _drawTextBg(
+        canvas, statText, Offset(8, t + 58), const Color(0xFFFFFF00), 12);
+    // 구간별 소요시간 (하늘색)
+    if (stageText.isNotEmpty) {
+      _drawTextBg(
+          canvas, stageText, Offset(8, t + 80), const Color(0xFF00FFFF), 12);
+    }
+    // detect 내부 구간 (주황색)
+    if (subText1.isNotEmpty) {
+      _drawTextBg(
+          canvas, subText1, Offset(8, t + 102), const Color(0xFFFFB74D), 12);
+    }
+    if (subText2.isNotEmpty) {
+      _drawTextBg(
+          canvas, subText2, Offset(8, t + 124), const Color(0xFFFFB74D), 12);
+    }
   }
 
   // 검은 배경 패치 위에 텍스트 (어떤 배경에서도 잘 보이게)
