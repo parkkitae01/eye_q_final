@@ -1,12 +1,14 @@
 // ════════════════════════════════════════════════════════════════
-// 👁️  EYE-Q : 메인 앱 (카메라 → YOLO → 트래커 → HUD)
+// 👁️  EYE-Q : 메인 앱 (카메라 → YOLO → 트래커 → 소리·진동 경고 → HUD)
 // ════════════════════════════════════════════════════════════════
 // ⚠️ 수정 이력
 //  1) YUV→RGB 변환을 compute()로 별도 isolate에서 실행 (UI 스레드 블로킹 제거)
 //  2) FPS 누적 통계 + 워밍업 프레임 제외 + 구간별 소요시간(conv/detect/track)
-//  3) [이번 수정] detect 내부 구간(lbox/fill/send/run/recv/flat/post)까지 HUD 표시
+//  3) detect 내부 구간(lbox/fill/send/run/recv/flat/post)까지 HUD 표시
 //     + FPS 배지가 상태바 시계와 겹치던 문제 수정 (상태바 높이만큼 HUD를 아래로 내림)
-// 기존 lib/main.dart 내용을 전부 지우고 이걸로 교체하세요.
+//  4) [이번 수정] 소리(TTS)+진동 경고 추가 (alert_manager.dart)
+//     - 화면을 한 번 탭하면 경고 ON/OFF
+//     - HUD에 경고 지연(프레임 도착→경고 명령, ms)과 마지막 문장 표시
 // ════════════════════════════════════════════════════════════════
 
 import 'dart:typed_data';
@@ -16,6 +18,7 @@ import 'package:flutter/foundation.dart'; // compute(), debugPrint
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
+import 'alert_manager.dart';
 import 'object_tracker.dart';
 import 'risk_engine.dart';
 import 'yolo_detector.dart';
@@ -53,6 +56,7 @@ class _DetectionScreenState extends State<DetectionScreen> {
   CameraController? _camera;
   final YoloDetector _detector = YoloDetector();
   final ObjectTracker _tracker = ObjectTracker();
+  final AlertManager _alert = AlertManager();
 
   List<Detection> _detections = [];
   Detection? _top;
@@ -83,9 +87,10 @@ class _DetectionScreenState extends State<DetectionScreen> {
 
   Future<void> _setup() async {
     await _detector.init();
+    await _alert.init();
     _camera = CameraController(
       _cameras.first,
-      ResolutionPreset.medium,
+      ResolutionPreset.medium, // 화면 미리보기 화질 유지 (분석용 변환은 아래에서 절반 크기로)
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
@@ -145,6 +150,9 @@ class _DetectionScreenState extends State<DetectionScreen> {
       );
       final top = _tracker.topThreat(dets);
       swTrk.stop();
+
+      // ④ 소리·진동 경고 (now = 이 프레임이 도착한 시각 → 지연 측정 기준)
+      _alert.update(top, iw, ih, now);
 
       final double fpsNow = dt > 0 ? 1 / dt : 0;
 
@@ -210,6 +218,7 @@ class _DetectionScreenState extends State<DetectionScreen> {
     _camera?.stopImageStream();
     _camera?.dispose();
     _detector.dispose();
+    _alert.dispose();
     super.dispose();
   }
 
@@ -248,25 +257,37 @@ class _DetectionScreenState extends State<DetectionScreen> {
       sub2 = 'detect: recv ${f(4)} / flat ${f(5)} / post ${f(6)}';
     }
 
+    // 경고 상태 줄 (탭하면 ON/OFF)
+    final String alertText = _alert.enabled
+        ? 'ALERT ON  last ${_alert.lastLatencyMs}ms  #${_alert.alertCount}'
+        '${_alert.lastText.isEmpty ? "" : "  ${_alert.lastText}"}'
+        : 'ALERT OFF (tap to turn on)';
+
     return Scaffold(
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          CameraPreview(_camera!),
-          CustomPaint(
-            painter: _HudPainter(
-              detections: _detections,
-              top: _top,
-              imageSize: _imageSize,
-              fps: _fps,
-              topInset: topInset,
-              statText: statText,
-              stageText: stageText,
-              subText1: sub1,
-              subText2: sub2,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => setState(() => _alert.enabled = !_alert.enabled),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            CameraPreview(_camera!),
+            CustomPaint(
+              painter: _HudPainter(
+                detections: _detections,
+                top: _top,
+                imageSize: _imageSize,
+                fps: _fps,
+                topInset: topInset,
+                statText: statText,
+                stageText: stageText,
+                subText1: sub1,
+                subText2: sub2,
+                alertText: alertText,
+                alertOn: _alert.enabled,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -294,13 +315,17 @@ class _YuvFrame {
 // ─── CameraImage(YUV420) → image.Image(RGB) ───
 //   ⚠️ top-level 함수여야 compute()에서 별도 isolate로 실행 가능함
 img.Image _convertYuv420(_YuvFrame f) {
-  final image = img.Image(width: f.width, height: f.height);
-  for (int y = 0; y < f.height; y++) {
-    for (int x = 0; x < f.width; x++) {
-      final int uvIndex =
-          f.uvPixelStride * (x ~/ 2) + f.uvRowStride * (y ~/ 2);
-      final int yIndex = y * f.yRowStride + x;
-      final int yp = f.yBytes[yIndex];
+  // 분석용이라 가로·세로를 절반으로 줄여서 변환 (2칸씩 건너뛰며 샘플링)
+  // → 변환 비용이 약 1/4. 화면 미리보기(CameraPreview)는 원본 화질 그대로.
+  final int w = f.width ~/ 2;
+  final int h = f.height ~/ 2;
+  final image = img.Image(width: w, height: h);
+  for (int y = 0; y < h; y++) {
+    final int yRow = (y * 2) * f.yRowStride;
+    final int uvRow = f.uvRowStride * y; // (2y) ~/ 2 == y
+    for (int x = 0; x < w; x++) {
+      final int uvIndex = f.uvPixelStride * x + uvRow; // (2x) ~/ 2 == x
+      final int yp = f.yBytes[yRow + x * 2];
       final int up = f.uBytes[uvIndex];
       final int vp = f.vBytes[uvIndex];
       final int r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
@@ -314,7 +339,7 @@ img.Image _convertYuv420(_YuvFrame f) {
   return image;
 }
 
-// ─── 4-5: 박스 + HUD 그리기 ───
+// ─── 박스 + HUD 그리기 ───
 class _HudPainter extends CustomPainter {
   final List<Detection> detections;
   final Detection? top;
@@ -325,6 +350,8 @@ class _HudPainter extends CustomPainter {
   final String stageText; // conv/detect/track 줄
   final String subText1; // detect 내부 구간 1
   final String subText2; // detect 내부 구간 2
+  final String alertText; // 경고 상태 줄
+  final bool alertOn;
 
   _HudPainter({
     required this.detections,
@@ -336,10 +363,12 @@ class _HudPainter extends CustomPainter {
     required this.stageText,
     required this.subText1,
     required this.subText2,
+    required this.alertText,
+    required this.alertOn,
   });
 
   // HUD 영역 아래쪽 끝 (박스 라벨이 HUD와 겹치지 않게 하는 기준선)
-  double get hudBottom => topInset + 148;
+  double get hudBottom => topInset + 170;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -404,6 +433,9 @@ class _HudPainter extends CustomPainter {
       _drawTextBg(
           canvas, subText2, Offset(8, t + 124), const Color(0xFFFFB74D), 12);
     }
+    // 경고 상태 (켜짐=연두, 꺼짐=회색)
+    _drawTextBg(canvas, alertText, Offset(8, t + 146),
+        alertOn ? const Color(0xFF69F0AE) : const Color(0xFFBDBDBD), 12);
   }
 
   // 검은 배경 패치 위에 텍스트 (어떤 배경에서도 잘 보이게)

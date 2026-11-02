@@ -39,6 +39,8 @@ dependencies:
   camera: ^0.11.0+2              # 스마트폰 카메라 제어
   flutter_onnxruntime: ^1.5.1    # ONNX 모델 추론 엔진
   image: ^4.3.0                  # 이미지 전처리 (리사이즈/RGB 변환)
+  flutter_tts: ^4.2.5
+  vibration: ^3.2.1
 
 dev_dependencies:
   flutter_test:
@@ -67,6 +69,8 @@ flutter:
   # AI 모델 파일을 앱 자산으로 포함
   assets:
     - assets/models/yolov8n.onnx
+    - assets/models/stairs_bg_v2.onnx
+    - assets/models/stairs_field_v1.onnx
     - assets/test_images/
     - assets/test_images/천천히_걷기_1/
     - assets/test_images/천천히_걷기_1-2/

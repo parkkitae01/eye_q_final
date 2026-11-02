@@ -1,21 +1,12 @@
 // ════════════════════════════════════════════════════════════════
-// 👁️  EYE-Q : YOLOv8n ONNX 탐지기 (블록 4-3)  — v4 속도 개선판
+// 👁️  EYE-Q : YOLOv8n ONNX 탐지기 (v7: 모델 전환 + 점수 진단 로그)
 // ════════════════════════════════════════════════════════════════
 // 파일 위치: lib/yolo_detector.dart
 //
-// v5 변경점
-//   - 입력 크기 640 → 320 (모델도 imgsz=320으로 다시 export 해야 함)
-//   - 카메라 프레임 회전 보정: detect(img, rotation: sensorOrientation)
-//     (카메라 원본은 가로로 누운 상태라 모델이 옆으로 누운 세상을 보고 있었음)
-//   - XNNPACK은 kUseXnnpack 플래그로 끄고 켤 수 있게 함 (기본 꺼짐)
-// v4 변경점 (측정 결과 기반: detect 553ms 중 전처리 176 + 출력 변환 203ms가 낭비)
-//   1) 전처리: image 패키지의 copyResize/fill/compositeImage/getPixel 대신
-//      원본 바이트에서 바로 640x640 텐서로 샘플링 (결과는 기존과 동일: nearest + 회색 114 패딩)
-//   2) 후처리: 70만 개짜리 중첩 리스트를 flatten 하지 않고 행 단위로 바로 읽음
-//   3) ONNX 세션: XNNPACK + 4스레드 시도 (실패하면 기본 설정으로 자동 대체)
-//   4) 프레임마다 찍던 print 제거
-// DetectTimings 필드 이름은 그대로라서 main.dart는 수정할 필요 없음
-//   lbox = 바이트·좌표표 준비, fill = 텐서 채우기, flat = 출력 행 추출
+// v7 변경점
+//   - 계단 모델 파일 이름을 stairs_bg_v2.onnx 로 변경 (낡은 사본 사용 방지)
+//   - 30프레임마다 "가장 높은 후보 점수"를 로그로 출력 ([YOLO] frame N top score=...)
+// v6: kStairsModel 스위치 (true=계단 전용, false=기존 COCO)
 // ════════════════════════════════════════════════════════════════
 
 import 'dart:math' as math;
@@ -27,11 +18,17 @@ import 'package:image/image.dart' as img;
 
 import 'object_tracker.dart'; // RawDetection
 
-// 모델 입력 크기 — ONNX export 시 imgsz와 같아야 함 (이번엔 320으로 export)
+// 모델 입력 크기 — ONNX export 시 imgsz와 같아야 함 (320)
 const int kInputSize = 320;
 const bool kUseXnnpack = false; // true면 XNNPACK + 4스레드 시도
 const double kConfThreshold = 0.4; // 이 점수 미만 후보는 버림
 const double kNmsIou = 0.45; // 이 이상 겹치면 중복으로 제거
+
+// 모델 선택: true = 계단 전용 모델(시험용), false = 기존 COCO 모델(사람·자동차 등)
+const bool kStairsModel = true;
+const String kModelAsset = kStairsModel
+    ? 'assets/models/stairs_field_v1.onnx'
+    : 'assets/models/yolov8n.onnx';
 
 // COCO 80 클래스 이름 (label 표시용)
 const List<String> kCocoLabels = [
@@ -48,6 +45,9 @@ const List<String> kCocoLabels = [
   'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
   'hair drier', 'toothbrush',
 ];
+
+// 지금 쓰는 모델의 클래스 이름 목록
+const List<String> kActiveLabels = kStairsModel ? ['stairs'] : kCocoLabels;
 
 // NMS 내부용 후보
 class _Cand {
@@ -74,6 +74,7 @@ class YoloDetector {
   String _inputName = '';
   String _outputName = '';
   bool _ready = false;
+  int _dbgN = 0; // 진단 로그용 프레임 카운터
 
   final DetectTimings timings = DetectTimings();
 
@@ -82,7 +83,7 @@ class YoloDetector {
   // ─── 모델 로드 ───
   Future<void> init() async {
     _ort = OnnxRuntime();
-    const modelAsset = 'assets/models/yolov8n.onnx';
+    const modelAsset = kModelAsset;
     if (kUseXnnpack) {
       try {
         _session = await _ort!.createSessionFromAsset(
@@ -107,6 +108,8 @@ class YoloDetector {
     _inputName = _session.inputNames.first as String;
     _outputName = _session.outputNames.first as String;
     _ready = true;
+    // ignore: avoid_print
+    print('[YOLO] model=$modelAsset classes=${kActiveLabels.length}');
     // ignore: avoid_print
     print('[YOLO] inputs=${_session.inputNames} outputs=${_session.outputNames}');
   }
@@ -239,10 +242,11 @@ class YoloDetector {
     final rawOutput = await outputs[_outputName]!.asList();
     timings.receive = mark();
 
-    // 4) 출력 [1, 84, N]을 84개의 행으로 나눔 (N은 보통 8400)
-    //    행 0~3 = cx,cy,w,h  /  행 4~83 = 클래스 점수 80개
-    const int numClasses = 80;
-    const int numRows = 4 + numClasses;
+    // 4) 출력 [1, 4+클래스수, N]을 (4+클래스수)개의 행으로 나눔
+    //    행 0~3 = cx,cy,w,h  /  나머지 행 = 클래스 점수
+    //    (COCO 모델: 84행 x 2100칸, 계단 모델: 5행 x 2100칸)
+    final int numClasses = kActiveLabels.length;
+    final int numRows = 4 + numClasses;
     List<List<dynamic>> rows;
     final dynamic o = rawOutput;
     if (o is List &&
@@ -276,6 +280,16 @@ class YoloDetector {
       }
     }
 
+    // [진단] 30프레임마다 가장 높은 후보 점수 출력 (임계값 0.4 이상이면 경고 대상)
+    if (++_dbgN % 30 == 0) {
+      double mx = 0;
+      for (int a = 0; a < numBoxes; a++) {
+        if (best[a] > mx) mx = best[a];
+      }
+      // ignore: avoid_print
+      print('[YOLO] frame $_dbgN top score=${mx.toStringAsFixed(2)} model=$kModelAsset');
+    }
+
     final cands = <_Cand>[];
     final List<dynamic> rCx = rows[0];
     final List<dynamic> rCy = rows[1];
@@ -284,7 +298,7 @@ class YoloDetector {
     for (int a = 0; a < numBoxes; a++) {
       if (best[a] < kConfThreshold || bestCls[a] < 0) continue;
 
-      // 박스 (cx,cy,w,h, 640=letterbox 기준) → 원본 좌표 (letterbox 역변환)
+      // 박스 (cx,cy,w,h, letterbox 기준) → 원본 좌표 (letterbox 역변환)
       final double cx = (rCx[a] as num).toDouble();
       final double cy = (rCy[a] as num).toDouble();
       final double w = (rW[a] as num).toDouble();
@@ -313,8 +327,8 @@ class YoloDetector {
         .map((c) => RawDetection(
       box: c.box,
       classId: c.classId,
-      label: c.classId < kCocoLabels.length
-          ? kCocoLabels[c.classId]
+      label: c.classId < kActiveLabels.length
+          ? kActiveLabels[c.classId]
           : 'obj',
     ))
         .toList();
