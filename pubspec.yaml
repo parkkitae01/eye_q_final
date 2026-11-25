@@ -71,6 +71,7 @@ flutter:
     - assets/models/yolov8n.onnx
     - assets/models/stairs_bg_v2.onnx
     - assets/models/stairs_field_v1.onnx
+    - assets/models/stairs_field_v2.onnx
     - assets/test_images/
     - assets/test_images/천천히_걷기_1/
     - assets/test_images/천천히_걷기_1-2/

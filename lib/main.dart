@@ -1,14 +1,15 @@
 // ════════════════════════════════════════════════════════════════
-// 👁️  EYE-Q : 메인 앱 (카메라 → YOLO → 트래커 → 소리·진동 경고 → HUD)
+// 👁️  EYE-Q : 메인 앱 (카메라 → YOLO → 트래커 → 소리·진동 경고 → 화면)
 // ════════════════════════════════════════════════════════════════
 // ⚠️ 수정 이력
 //  1) YUV→RGB 변환을 compute()로 별도 isolate에서 실행 (UI 스레드 블로킹 제거)
 //  2) FPS 누적 통계 + 워밍업 프레임 제외 + 구간별 소요시간(conv/detect/track)
-//  3) detect 내부 구간(lbox/fill/send/run/recv/flat/post)까지 HUD 표시
-//     + FPS 배지가 상태바 시계와 겹치던 문제 수정 (상태바 높이만큼 HUD를 아래로 내림)
-//  4) [이번 수정] 소리(TTS)+진동 경고 추가 (alert_manager.dart)
-//     - 화면을 한 번 탭하면 경고 ON/OFF
-//     - HUD에 경고 지연(프레임 도착→경고 명령, ms)과 마지막 문장 표시
+//  3) detect 내부 구간(lbox/fill/send/run/recv/flat/post)까지 측정
+//  4) 소리(TTS)+진동 경고 추가 (alert_manager.dart)
+//  5) [2026-11-24] 접근성 안내: 시작/토글 음성
+//  6) [2026-11-24] 발표용 미니멀 UI
+//     - 평소: 깔끔한 화면(둥근 박스 + 하단 안내 카드 + 위험 시 테두리 강조)
+//     - 오른쪽 위 버튼으로 디버깅 HUD(FPS·구간 시간 등) 전환 → 성능 측정은 그대로
 // ════════════════════════════════════════════════════════════════
 
 import 'dart:typed_data';
@@ -63,6 +64,7 @@ class _DetectionScreenState extends State<DetectionScreen> {
   Size _imageSize = Size.zero; // 카메라 프레임 해상도 (좌표 변환용)
   double _fps = 0;
   bool _busy = false; // 추론 중이면 프레임 스킵 (밀림 방지)
+  bool _debug = false; // [2026-11-24] 디버깅 HUD 표시 여부 (오른쪽 위 버튼)
   int _lastMs = DateTime.now().millisecondsSinceEpoch;
 
   // ── 성능 측정용 ──
@@ -88,6 +90,7 @@ class _DetectionScreenState extends State<DetectionScreen> {
   Future<void> _setup() async {
     await _detector.init();
     await _alert.init();
+    _alert.announceStart(); // 시작 음성 안내
     _camera = CameraController(
       _cameras.first,
       ResolutionPreset.medium, // 화면 미리보기 화질 유지 (분석용 변환은 아래에서 절반 크기로)
@@ -222,6 +225,18 @@ class _DetectionScreenState extends State<DetectionScreen> {
     super.dispose();
   }
 
+  // 위험 단계별 강조 색
+  Color _accentFor(AlertLevel level) {
+    switch (level) {
+      case AlertLevel.danger:
+        return const Color(0xFFE5484D); // 빨강
+      case AlertLevel.caution:
+        return const Color(0xFFF0A92E); // 주황
+      case AlertLevel.none:
+        return const Color(0xFF32C759); // 초록(안전)
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_camera == null || !_camera!.value.isInitialized) {
@@ -230,10 +245,155 @@ class _DetectionScreenState extends State<DetectionScreen> {
       );
     }
 
-    // 상태바 높이: HUD가 시계/상태 아이콘과 겹치지 않도록 이만큼 아래로 내린다
     final double topInset = MediaQuery.of(context).padding.top;
 
-    // HUD에 표시할 통계 문자열
+    // 현재 최상위 위협의 경고 단계 (화면 색·아이콘용)
+    final AlertLevel level =
+    _top != null ? _alert.levelOf(_top!) : AlertLevel.none;
+    final Color accent = _accentFor(level);
+    final bool hasThreat = _top != null && level != AlertLevel.none;
+
+    // 하단 안내 카드에 띄울 문구 (음성과 같은 내용)
+    final String guide = _alert.lastText.isEmpty ? '대기 중' : _alert.lastText;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        // 화면 아무 곳이나 탭 → 경고 ON/OFF (음성 안내)
+        onTap: () {
+          setState(() => _alert.enabled = !_alert.enabled);
+          _alert.announceToggle();
+        },
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // 1) 카메라 미리보기
+            CameraPreview(_camera!),
+
+            // 2) 탐지 박스 (평소: 둥근 박스 / 디버그: 원본 라벨)
+            CustomPaint(
+              painter: _BoxPainter(
+                detections: _detections,
+                top: _top,
+                imageSize: _imageSize,
+                minimal: !_debug,
+                topColor: accent,
+              ),
+            ),
+
+            // 3) 위험 시 화면 테두리 강조
+            if (hasThreat)
+              IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: accent, width: 8),
+                  ),
+                ),
+              ),
+
+            // 4) 상단 바 (앱 이름 · 경고 on/off · 디버그 전환)
+            Positioned(
+              top: topInset + 8,
+              left: 18,
+              right: 12,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'EYE-Q',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Icon(
+                        _alert.enabled ? Icons.volume_up : Icons.volume_off,
+                        color: _alert.enabled ? Colors.white : Colors.white54,
+                        size: 24,
+                      ),
+                      IconButton(
+                        onPressed: () => setState(() => _debug = !_debug),
+                        icon: Icon(
+                          Icons.tune,
+                          color: _debug ? accent : Colors.white54,
+                          size: 24,
+                        ),
+                        tooltip: '개발자 정보',
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            // 5) 디버그 HUD (성능 측정용) — 버튼으로 켤 때만
+            if (_debug)
+              Positioned(
+                top: topInset + 52,
+                left: 12,
+                child: _debugHud(),
+              ),
+
+            // 6) 하단 안내 카드 (음성과 같은 안내를 크게)
+            Positioned(
+              left: 20,
+              right: 20,
+              bottom: 40,
+              child: Semantics(
+                liveRegion: true,
+                label: guide,
+                child: Container(
+                  padding:
+                  const EdgeInsets.symmetric(horizontal: 24, vertical: 22),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.62),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: hasThreat ? accent : Colors.white24,
+                      width: 2,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        hasThreat
+                            ? Icons.warning_amber_rounded
+                            : Icons.check_circle_outline,
+                        color: accent,
+                        size: 40,
+                      ),
+                      const SizedBox(width: 18),
+                      Expanded(
+                        child: Text(
+                          guide,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 26,
+                            fontWeight: FontWeight.w700,
+                            height: 1.25,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 디버그용 성능 HUD (버튼으로 켤 때만 표시)
+  Widget _debugHud() {
     final String statText = _statFrames == 0
         ? 'warm-up $_frameCount/$_warmupFrames'
         : 'avg ${_fpsAvg.toStringAsFixed(1)} / '
@@ -251,43 +411,37 @@ class _DetectionScreenState extends State<DetectionScreen> {
           'detect ${d.toStringAsFixed(0)} / '
           'track ${t.toStringAsFixed(0)} '
           '(sum ${(c + d + t).toStringAsFixed(0)})';
-
       String f(int i) => (_sumSub[i] / _statFrames).toStringAsFixed(0);
       sub1 = 'detect: lbox ${f(0)} / fill ${f(1)} / send ${f(2)} / run ${f(3)}';
       sub2 = 'detect: recv ${f(4)} / flat ${f(5)} / post ${f(6)}';
     }
 
-    // 경고 상태 줄 (탭하면 ON/OFF)
     final String alertText = _alert.enabled
         ? 'ALERT ON  last ${_alert.lastLatencyMs}ms  #${_alert.alertCount}'
-        '${_alert.lastText.isEmpty ? "" : "  ${_alert.lastText}"}'
-        : 'ALERT OFF (tap to turn on)';
+        : 'ALERT OFF';
 
-    return Scaffold(
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () => setState(() => _alert.enabled = !_alert.enabled),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            CameraPreview(_camera!),
-            CustomPaint(
-              painter: _HudPainter(
-                detections: _detections,
-                top: _top,
-                imageSize: _imageSize,
-                fps: _fps,
-                topInset: topInset,
-                statText: statText,
-                stageText: stageText,
-                subText1: sub1,
-                subText2: sub2,
-                alertText: alertText,
-                alertOn: _alert.enabled,
-              ),
-            ),
-          ],
-        ),
+    Widget line(String s, Color c) => Text(
+      s,
+      style: TextStyle(color: c, fontSize: 12, fontWeight: FontWeight.bold),
+    );
+
+    return Container(
+      padding: const EdgeInsets.all(8),
+      color: const Color(0xCC000000),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          line('FPS: ${_fps.toStringAsFixed(0)}', Colors.white),
+          line(_top != null ? _top!.summaryText : 'No threat',
+              _top != null ? const Color(0xFFFF6B6B) : const Color(0xFF00FF88)),
+          line(statText, const Color(0xFFFFEB3B)),
+          if (stageText.isNotEmpty) line(stageText, const Color(0xFF4DD0E1)),
+          if (sub1.isNotEmpty) line(sub1, const Color(0xFFFFB74D)),
+          if (sub2.isNotEmpty) line(sub2, const Color(0xFFFFB74D)),
+          line(alertText,
+              _alert.enabled ? const Color(0xFF69F0AE) : Colors.white54),
+        ],
       ),
     );
   }
@@ -339,36 +493,23 @@ img.Image _convertYuv420(_YuvFrame f) {
   return image;
 }
 
-// ─── 박스 + HUD 그리기 ───
-class _HudPainter extends CustomPainter {
+// ─── 탐지 박스 그리기 ───
+//   minimal=true  : 발표용 (둥근 박스만, 라벨은 하단 카드가 담당)
+//   minimal=false : 디버그 (원본 사각 박스 + 영어 라벨/TTC/점수)
+class _BoxPainter extends CustomPainter {
   final List<Detection> detections;
   final Detection? top;
   final Size imageSize;
-  final double fps;
-  final double topInset; // 상태바 높이 (HUD 시작 위치)
-  final String statText; // avg/min/max FPS 줄
-  final String stageText; // conv/detect/track 줄
-  final String subText1; // detect 내부 구간 1
-  final String subText2; // detect 내부 구간 2
-  final String alertText; // 경고 상태 줄
-  final bool alertOn;
+  final bool minimal;
+  final Color topColor;
 
-  _HudPainter({
+  _BoxPainter({
     required this.detections,
     required this.top,
     required this.imageSize,
-    required this.fps,
-    required this.topInset,
-    required this.statText,
-    required this.stageText,
-    required this.subText1,
-    required this.subText2,
-    required this.alertText,
-    required this.alertOn,
+    required this.minimal,
+    required this.topColor,
   });
-
-  // HUD 영역 아래쪽 끝 (박스 라벨이 HUD와 겹치지 않게 하는 기준선)
-  double get hudBottom => topInset + 170;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -376,12 +517,8 @@ class _HudPainter extends CustomPainter {
     final double scaleX = size.width / imageSize.width;
     final double scaleY = size.height / imageSize.height;
 
-    // ── 박스 + 라벨 ──
     for (final d in detections) {
       final bool isTop = top != null && d.trackId == top!.trackId;
-      final Color color =
-      isTop ? const Color(0xFFFF0000) : const Color(0xFF969696);
-
       final rect = Rect.fromLTRB(
         d.box.left * scaleX,
         d.box.top * scaleY,
@@ -389,79 +526,50 @@ class _HudPainter extends CustomPainter {
         d.box.bottom * scaleY,
       );
 
-      final paint = Paint()
-        ..color = color
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = isTop ? 4 : 1;
-      canvas.drawRect(rect, paint);
+      if (minimal) {
+        // 발표용: 둥근 박스. 최상위 위협만 강조, 나머지는 은은하게.
+        final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(16));
+        final paint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = isTop ? 5 : 2
+          ..color = isTop ? topColor : Colors.white.withOpacity(0.35);
+        canvas.drawRRect(rrect, paint);
+      } else {
+        // 디버그: 원본 사각 박스 + 라벨
+        final Color color =
+        isTop ? const Color(0xFFFF0000) : const Color(0xFF969696);
+        final paint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = isTop ? 4 : 1
+          ..color = color;
+        canvas.drawRect(rect, paint);
 
-      final String label = isTop
-          ? '!! THREAT: ${d.label}  '
-          'TTC:${d.ttc.isInfinite ? "--" : d.ttc.toStringAsFixed(1)}s  '
-          'Score:${d.score.toStringAsFixed(2)}'
-          : '${kGradeName[d.grade]} ${d.label}';
-
-      // 라벨 위치: 박스 위 → 헤더와 겹치면 박스 아래로 → 화면 밖이면 박스 안쪽
-      double ly = rect.top - 16;
-      if (ly < hudBottom) ly = rect.bottom + 2;
-      if (ly + 16 > size.height) ly = rect.top + 2;
-      _drawTextBg(canvas, label, Offset(rect.left, ly), color, 12);
+        final String label = isTop
+            ? '!! THREAT: ${d.label}  '
+            'TTC:${d.ttc.isInfinite ? "--" : d.ttc.toStringAsFixed(1)}s  '
+            'Score:${d.score.toStringAsFixed(2)}'
+            : '${kGradeName[d.grade]} ${d.label}';
+        final tp = TextPainter(
+          text: TextSpan(
+            text: label,
+            style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.bold),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        double ly = rect.top - 16;
+        if (ly < 0) ly = rect.bottom + 2;
+        final double lx = rect.left < 0 ? 0 : rect.left;
+        final bg = Paint()..color = const Color(0xCC000000);
+        canvas.drawRect(
+            Rect.fromLTWH(lx, ly, tp.width + 6, tp.height + 2), bg);
+        tp.paint(canvas, Offset(lx + 3, ly + 1));
+      }
     }
-
-    // ── 상단 HUD (상태바 아래부터) ──
-    final double t = topInset;
-    _drawTextBg(canvas, 'FPS: ${fps.toStringAsFixed(0)}', Offset(8, t + 8),
-        const Color(0xFFFFFFFF), 14);
-    final String summary = top != null ? top!.summaryText : 'No threat';
-    _drawTextBg(canvas, summary, Offset(8, t + 34),
-        top != null ? const Color(0xFFFF0000) : const Color(0xFF00FF00), 14);
-
-    // 누적 FPS 통계 (노란색)
-    _drawTextBg(
-        canvas, statText, Offset(8, t + 58), const Color(0xFFFFFF00), 12);
-    // 구간별 소요시간 (하늘색)
-    if (stageText.isNotEmpty) {
-      _drawTextBg(
-          canvas, stageText, Offset(8, t + 80), const Color(0xFF00FFFF), 12);
-    }
-    // detect 내부 구간 (주황색)
-    if (subText1.isNotEmpty) {
-      _drawTextBg(
-          canvas, subText1, Offset(8, t + 102), const Color(0xFFFFB74D), 12);
-    }
-    if (subText2.isNotEmpty) {
-      _drawTextBg(
-          canvas, subText2, Offset(8, t + 124), const Color(0xFFFFB74D), 12);
-    }
-    // 경고 상태 (켜짐=연두, 꺼짐=회색)
-    _drawTextBg(canvas, alertText, Offset(8, t + 146),
-        alertOn ? const Color(0xFF69F0AE) : const Color(0xFFBDBDBD), 12);
-  }
-
-  // 검은 배경 패치 위에 텍스트 (어떤 배경에서도 잘 보이게)
-  void _drawTextBg(
-      Canvas canvas, String text, Offset pos, Color color, double fontSize) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: text,
-        style: TextStyle(
-          color: color,
-          fontSize: fontSize,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-
-    final double x = pos.dx < 0 ? 0.0 : pos.dx; // 화면 왼쪽으로 안 넘치게
-    final bg = Paint()..color = const Color(0xCC000000);
-    canvas.drawRect(
-      Rect.fromLTWH(x, pos.dy, tp.width + 6, tp.height + 2),
-      bg,
-    );
-    tp.paint(canvas, Offset(x + 3, pos.dy + 1));
   }
 
   @override
-  bool shouldRepaint(covariant _HudPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _BoxPainter oldDelegate) => true;
 }

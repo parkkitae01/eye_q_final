@@ -99,6 +99,14 @@ double estimateTtc(List<(double, double)> history) {
 const double kProximityCriticalRatio = 0.8;
 const double kForcedProximityTtc = 0.1;
 
+// ─────────────────────────────────────────────
+// 계단: 다가오는 물체가 아니라 고정 지형 → TTC 대신 박스 크기(=거리)로 판단
+//   (현장 테스트하면서 바꾸세요. 아래 두 값은 임시 기준입니다)
+// ─────────────────────────────────────────────
+const int kStairsClassId = 80; // 계단 모델 전용 번호 (사람=0과 겹침 방지)
+const double kStairsMediumRatio = 0.30; // 박스 높이/화면 높이 이 이상 → MEDIUM
+const double kStairsHighRatio = 0.55; // 이 이상 → HIGH (계단은 80% 이상이어도 HIGH, CRITICAL 없음)
+
 bool isProximityCritical(double boxHeight, double frameHeight) {
   if (frameHeight <= 0) return false;
   return (boxHeight / frameHeight) >= kProximityCriticalRatio;
@@ -126,7 +134,9 @@ double computeRiskScore(RiskGrade grade, double ttc, double dirW) {
 // ─────────────────────────────────────────────
 // 최종 위험 판정 (grade, ttc, score)을 한 번에 계산.
 //   - 기본 흐름: getRiskLevel() → estimateTtc() → computeRiskScore()
-//   - 단, 근접 안전장치(isProximityCritical)에 걸리면
+//   - 계단(kStairsClassId)은 TTC 대신 박스 크기(거리)로 등급을 매김
+//     (근접 안전장치보다 먼저 판단 → 계단은 CRITICAL이 되지 않음)
+//   - 그 외 물체는 근접 안전장치(isProximityCritical)에 걸리면
 //     classId나 트랙 히스토리 상태와 무관하게 CRITICAL로 덮어씀
 //   Detection을 만드는 호출부(트래커/메인 루프)에서는
 //   getRiskLevel()/estimateTtc()/computeRiskScore()를 따로 부르지 말고
@@ -139,6 +149,18 @@ double computeRiskScore(RiskGrade grade, double ttc, double dirW) {
   required double boxHeight,
   required double frameHeight,
 }) {
+  // 계단: TTC가 아니라 박스 크기(거리)로 등급 결정
+  //  [2026-11-12] 근접 안전장치보다 먼저 판단한다.
+  //   계단은 다가오는 물체가 아닌 고정 지형이므로 강제 CRITICAL(TTC 0.1초)을 적용하지 않음.
+  //   (화면을 크게 덮는 오탐 박스가 "위험!" 경고로 나가던 문제 수정)
+  if (classId == kStairsClassId) {
+    final ratio = frameHeight > 0 ? boxHeight / frameHeight : 0.0;
+    final g = ratio >= kStairsHighRatio
+        ? RiskGrade.high
+        : (ratio >= kStairsMediumRatio ? RiskGrade.medium : RiskGrade.low);
+    return (g, double.infinity, kGradeWeight[g]! * ratio * dirW);
+  }
+
   if (isProximityCritical(boxHeight, frameHeight)) {
     final score = computeRiskScore(
       RiskGrade.critical,

@@ -1,11 +1,13 @@
 // ════════════════════════════════════════════════════════════════
-// 👁️  EYE-Q : YOLOv8n ONNX 탐지기 (v7: 모델 전환 + 점수 진단 로그)
+// 👁️  EYE-Q : YOLOv8n ONNX 탐지기 (v8: 계단 클래스 번호 80 분리)
 // ════════════════════════════════════════════════════════════════
 // 파일 위치: lib/yolo_detector.dart
 //
-// v7 변경점
-//   - 계단 모델 파일 이름을 stairs_bg_v2.onnx 로 변경 (낡은 사본 사용 방지)
-//   - 30프레임마다 "가장 높은 후보 점수"를 로그로 출력 ([YOLO] frame N top score=...)
+// v8 변경점
+//   - 계단 모델의 classId를 kStairsClassId(80)로 반환 (사람=0과 겹쳐서
+//     계단이 사람(HIGH)으로 판정되던 문제 수정). label은 그대로 'stairs'.
+//   - 계단 모델 파일은 stairs_field_v1.onnx (현장 영상 보정 모델)
+// v7: 30프레임마다 "가장 높은 후보 점수"를 로그로 출력 ([YOLO] frame N top score=...)
 // v6: kStairsModel 스위치 (true=계단 전용, false=기존 COCO)
 // ════════════════════════════════════════════════════════════════
 
@@ -17,17 +19,20 @@ import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'package:image/image.dart' as img;
 
 import 'object_tracker.dart'; // RawDetection
+import 'risk_engine.dart'; // kStairsClassId1
 
 // 모델 입력 크기 — ONNX export 시 imgsz와 같아야 함 (320)
 const int kInputSize = 320;
 const bool kUseXnnpack = false; // true면 XNNPACK + 4스레드 시도
-const double kConfThreshold = 0.4; // 이 점수 미만 후보는 버림
+// [2026-11-12] 계단 모델은 오탐이 많아 기준을 더 엄격하게 (0.4 → 0.6). COCO 모델은 0.4 유지.
+//   현장에서 진짜 계단을 놓치면 0.5로 낮춰 보세요.
+const double kConfThreshold = kStairsModel ? 0.4 : 0.4; // 이 점수 미만 후보는 버림
 const double kNmsIou = 0.45; // 이 이상 겹치면 중복으로 제거
 
 // 모델 선택: true = 계단 전용 모델(시험용), false = 기존 COCO 모델(사람·자동차 등)
-const bool kStairsModel = true;
+const bool kStairsModel = false;
 const String kModelAsset = kStairsModel
-    ? 'assets/models/stairs_field_v1.onnx'
+    ? 'assets/models/stairs_field_v2.onnx'
     : 'assets/models/yolov8n.onnx';
 
 // COCO 80 클래스 이름 (label 표시용)
@@ -280,7 +285,7 @@ class YoloDetector {
       }
     }
 
-    // [진단] 30프레임마다 가장 높은 후보 점수 출력 (임계값 0.4 이상이면 경고 대상)
+    // [진단] 30프레임마다 가장 높은 후보 점수 출력 (kConfThreshold 이상이면 탐지로 인정)
     if (++_dbgN % 30 == 0) {
       double mx = 0;
       for (int a = 0; a < numBoxes; a++) {
@@ -323,10 +328,12 @@ class YoloDetector {
     timings.post = mark();
 
     // 8) RawDetection으로 변환해서 반환
+    //    계단 모델은 classId를 kStairsClassId(80)로 내보냄 (사람=0과 겹침 방지).
+    //    label은 모델 안의 번호(c.classId)로 찾으므로 그대로 'stairs'.
     return kept
         .map((c) => RawDetection(
       box: c.box,
-      classId: c.classId,
+      classId: kStairsModel ? kStairsClassId : c.classId,
       label: c.classId < kActiveLabels.length
           ? kActiveLabels[c.classId]
           : 'obj',
